@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "geochef-mcp"
+version = "0.1.0"
+description = "MCP Server for GeoChef - RS-VLM Dataset Intelligence"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+keywords = ["mcp", "remote-sensing", "dataset", "vlm", "geochef"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Programming Language :: Python :: 3",
+]
+dependencies = [
+    "mcp[cli]>=1.0.0",
+    "pandas>=2.0.0",
+    "openpyxl>=3.1.0",
+]
+
+[project.scripts]
+geochef-mcp = "geochef_mcp.server:main"
+
+[project.urls]
+Homepage = "https://github.com/VisionXLab/Awesome-RS-VL-Data"
+Repository = "https://github.com/VisionXLab/Awesome-RS-VL-Data"
+
+[tool.hatch.build.targets.wheel]
+packages = ["geochef_mcp"]
