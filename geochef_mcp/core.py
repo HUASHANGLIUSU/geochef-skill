@@ -46,7 +46,7 @@ class GeoChef:
                     item = row.dropna().to_dict()
                     item["_sheet"] = sheet
                     item["_text"] = json.dumps(item, ensure_ascii=False).lower()
-                    item["_years"] = set(re.findall(r'\b(199\d|20[0-2]\d)\b', item["_text"]))
+                    item["_years"] = set(re.findall(r'\b(199\d|20\d{2})\b', item["_text"]))
                     items.append(item)
 
                     p = str(item.get("Publisher", item.get("publisher", ""))).strip()
@@ -85,6 +85,9 @@ class GeoChef:
             if name and name not in self._name_to_item:
                 self._name_to_item[name] = item
         self._stats_cache: dict | None = None
+        self._geo_stats_cache: dict | None = None
+        self._trend_stats_cache: dict | None = None
+        self._data_path: str = path
 
     def get_all_sources(self) -> list[str]:
         return self._all_sources
@@ -184,6 +187,179 @@ class GeoChef:
             "sheet": dict(sheet_counter),
         }
         return self._stats_cache
+
+    def get_geo_stats(self) -> dict:
+        """返回国家/地区论文数量分布，格式：{nation: count, ...}，按数量降序。"""
+        if self._geo_stats_cache is not None:
+            return self._geo_stats_cache
+        try:
+            df = pd.read_excel(self._data_path, sheet_name="统计期刊数量、国家数量、年份")
+            nation_df = df[["nation", "nation_count"]].dropna()
+            nation_df = nation_df.copy()
+            nation_df["nation"] = nation_df["nation"].replace({"Australian": "Australia"})
+            nation_dict = {
+                str(row["nation"]).strip(): int(row["nation_count"])
+                for _, row in nation_df.iterrows()
+                if str(row["nation"]).strip() not in ("", "nan")
+            }
+            self._geo_stats_cache = dict(
+                sorted(nation_dict.items(), key=lambda x: x[1], reverse=True)
+            )
+        except Exception as e:
+            print(f"[GeoChef] 地理统计加载失败: {e}")
+            self._geo_stats_cache = {}
+        return self._geo_stats_cache
+
+    def get_trend_stats(self) -> dict:
+        """
+        按任务类型 × 年份统计数据集数量。
+        返回 {task: {year: count}, ...} 及总量 {year: count}。
+        """
+        if self._trend_stats_cache is not None:
+            return self._trend_stats_cache
+        from collections import defaultdict
+        trend: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        total: dict[str, int] = defaultdict(int)
+        for item in self.data:
+            yrs = item.get("_years", set())
+            if not yrs:
+                continue
+            year = min(yrs)
+            text = item.get("_text", "")
+            total[year] += 1
+            for task in TASK_LIST:
+                if task.lower() in text:
+                    trend[task][year] += 1
+        self._trend_stats_cache = {
+            "by_task": {task: dict(sorted(y.items())) for task, y in trend.items()},
+            "total": dict(sorted(total.items())),
+        }
+        return self._trend_stats_cache
+
+    def get_venue_stats(self) -> dict:
+        """返回期刊/会议论文数量分布，格式：{venue: count}，按数量降序。"""
+        try:
+            df = pd.read_excel(self._data_path, sheet_name="统计期刊数量、国家数量、年份")
+            venue_df = df[["article", "article_count"]].dropna()
+            venue_dict = {
+                str(row["article"]).strip(): int(row["article_count"])
+                for _, row in venue_df.iterrows()
+                if str(row["article"]).strip() not in ("", "nan")
+            }
+            return dict(sorted(venue_dict.items(), key=lambda x: x[1], reverse=True))
+        except Exception as e:
+            print(f"[GeoChef] 期刊统计加载失败: {e}")
+            return {}
+
+    def search_by_scale(self, min_samples: int | None, max_samples: int | None) -> list[dict]:
+        """按样本量范围筛选数据集。"""
+        import re as _re
+        results = []
+        for item in self.data:
+            raw = str(item.get("#Samples", "")).strip()
+            if not raw or raw.lower() in ("nan", "none", ""):
+                continue
+            # 去掉逗号/空格后提取第一个数字，支持 K/M 后缀
+            raw_clean = raw.replace(",", "").replace("，", "").replace(" ", "")
+            m = _re.search(r"[\d.]+", raw_clean)
+            if not m:
+                continue
+            try:
+                val = float(m.group())
+                suffix = raw_clean[m.end():m.end() + 1].upper()
+                if suffix == "K":
+                    val *= 1_000
+                elif suffix == "M":
+                    val *= 1_000_000
+            except ValueError:
+                continue
+            if min_samples is not None and val < min_samples:
+                continue
+            if max_samples is not None and val > max_samples:
+                continue
+            results.append(item)
+        return results
+
+    def find_similar(self, name: str, top_n: int = 8) -> list[tuple[dict, int]]:
+        """
+        基于结构化字段相似度打分，找出与指定数据集最相似的其他数据集。
+        返回 [(item, score), ...] 降序。
+        """
+        target = self.get_item_by_name(name)
+        if target is None:
+            return []
+        actual_name = str(target.get("Name", target.get("name", name))).strip()
+
+        t_sheet = target.get("_sheet", "")
+        t_modal = str(target.get("Modality", "")).strip().lower()
+        t_text = target.get("_text", "")
+        t_years = target.get("_years", set())
+        t_year = int(min(t_years)) if t_years else None
+        t_tasks = {task for task in TASK_LIST if task.lower() in t_text}
+
+        scored: list[tuple[dict, int]] = []
+        for item in self.data:
+            cname = str(item.get("Name", item.get("name", ""))).strip()
+            if cname == actual_name:
+                continue
+            score = 0
+            # 同 sheet（任务大类）+3
+            if item.get("_sheet", "") == t_sheet:
+                score += 3
+            # 模态匹配 +2
+            c_modal = str(item.get("Modality", "")).strip().lower()
+            if t_modal and c_modal and (t_modal in c_modal or c_modal in t_modal):
+                score += 2
+            # 任务类型重叠 +1/个
+            c_text = item.get("_text", "")
+            c_tasks = {task for task in TASK_LIST if task.lower() in c_text}
+            score += len(t_tasks & c_tasks)
+            # 年份相近（±2年）+1
+            c_years = item.get("_years", set())
+            if t_year and c_years:
+                c_year = int(min(c_years))
+                if abs(c_year - t_year) <= 2:
+                    score += 1
+            if score > 0:
+                scored.append((item, score))
+
+        scored.sort(key=lambda x: -x[1])
+        return scored[:top_n]
+
+    def get_publisher_datasets(self, publisher: str) -> list[dict]:
+        """返回指定发布单位的所有数据集。"""
+        pub_lower = publisher.strip().lower()
+        results = []
+        for item in self.data:
+            p = str(item.get("Publisher", item.get("publisher", ""))).strip().lower()
+            if pub_lower in p or p in pub_lower:
+                results.append(item)
+        return results
+
+    def get_timeline(self, task: str = "", modality: str = "") -> list[dict]:
+        """
+        返回按年份排序的数据集列表，可按任务/模态过滤。
+        每条包含 year, name, sheet, modality, samples, link_hint。
+        """
+        filtered = self.filter(
+            modals=[modality] if modality else [],
+            tasks=[task] if task else [],
+            years=[], publishers=[], methods=[], kws=[],
+        )
+        result = []
+        for item in filtered:
+            yrs = item.get("_years", set())
+            year = min(yrs) if yrs else "未知"
+            result.append({
+                "year": year,
+                "name": str(item.get("Name", item.get("name", ""))).strip(),
+                "sheet": item.get("_sheet", ""),
+                "modality": str(item.get("Modality", "")).strip(),
+                "samples": str(item.get("#Samples", "")).strip(),
+                "item": item,
+            })
+        result.sort(key=lambda x: (str(x["year"]), x["name"]))
+        return result
 
     def _check_modal(self, words, modals):
         if not modals: return True
